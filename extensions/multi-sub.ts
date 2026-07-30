@@ -1213,7 +1213,7 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 		const headers = new Headers({
 			Authorization: `Bearer ${auth.access}`,
 			Accept: "application/json",
-			"User-Agent": "pi-multi-pass",
+			"User-Agent": "pi-multi-oauth",
 		});
 		if (accountId) {
 			headers.set("chatgpt-account-id", accountId);

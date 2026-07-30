@@ -1,17 +1,11 @@
-# pi-multi-pass
+# pi-multi-oauth
 
 Multi-subscription extension for [pi](https://github.com/earendil-works/pi-coding-agent) -- use multiple OAuth accounts per provider with automatic rate-limit rotation and project-level affinity.
 
 ## Install
 
 ```bash
-pi install npm:pi-multi-pass
-```
-
-Install this fork via git:
-
-```bash
-pi install git:github.com/mfirdausazizi/pi-multi-pass
+pi install git:github.com/mfirdausazizi/pi-multi-oauth
 ```
 
 ## Features
@@ -41,7 +35,7 @@ pi install git:github.com/mfirdausazizi/pi-multi-pass
 /mp-preset coding-premium Activate a preset by name
 ```
 
-When one account hits a rate limit during an assistant turn, multi-pass automatically switches to the next eligible target and retries.
+When one account hits a rate limit during an assistant turn, multi-oauth automatically switches to the next eligible target and retries.
 
 ## Commands
 
@@ -99,7 +93,7 @@ When one account hits a rate limit during an assistant turn, multi-pass automati
 
 Use `/pool project` to configure per-project subscription affinity. This creates `.pi/multi-pass.json` in your project directory.
 
-When `allowedSubs` is set, multi-pass now treats it as an exact allow-list for this project: active routing, pool membership, and chain traversal are all constrained to those provider names.
+When `allowedSubs` is set, multi-oauth now treats it as an exact allow-list for this project: active routing, pool membership, and chain traversal are all constrained to those provider names.
 
 ### Use case: separate work and personal accounts
 
@@ -161,7 +155,7 @@ cd ~/side-project
 ## How pools work
 
 1. You're using `openai-codex` and hit a rate limit
-2. Multi-pass detects the error, marks `openai-codex` as exhausted
+2. Multi-oauth detects the error, marks `openai-codex` as exhausted
 3. Switches to `openai-codex-2` (same model ID, different account)
 4. Retries your last prompt automatically
 5. After a 5-minute cooldown, `openai-codex` becomes available again
@@ -281,7 +275,7 @@ If the script throws, returns an invalid provider name, or the file is missing, 
 ## How chains work
 
 1. You define an ordered chain of pool/model entries (for example `primary -> backup -> solo`)
-2. If the current pool has no eligible members, multi-pass continues forward in the chain
+2. If the current pool has no eligible members, multi-oauth continues forward in the chain
 3. It skips disabled or invalid entries and reports why in warnings
 4. During retry replays for the same prompt, it preserves cascade state and avoids re-trying already attempted providers
 5. Session status shows the active chain start entry: `chain:<name> | starts <pool> -> <model>`
@@ -359,18 +353,18 @@ Presets work with pools: if an entry's provider belongs to a pool, rate-limit fa
 
 ### Kiro setup
 
-Install and enable the Kiro provider before multi-pass:
+Install and enable the Kiro provider before multi-oauth:
 
 ```bash
 pi install npm:pi-provider-kiro-dev
-pi install git:github.com/mfirdausazizi/pi-multi-pass
+pi install git:github.com/mfirdausazizi/pi-multi-oauth
 ```
 
-Multi-pass reuses Kiro's registered stream handler, dynamic model catalog, login flow, and region/profile model metadata. Extra accounts are stored under provider IDs such as `kiro-2`.
+Multi-oauth reuses Kiro's registered stream handler, dynamic model catalog, login flow, and region/profile model metadata. Extra accounts are stored under provider IDs such as `kiro-2`.
 
 During login, selecting Kiro's **Use existing credentials** option explicitly imports the current IDE or `kiro-cli` credential into that extra account. Later refreshes use only that account's stored refresh token and never read from or write to the global Kiro CLI credential database. Unknown credential formats fail closed and require logging in again.
 
-If `pi-provider-kiro-dev` is not registered, the saved Kiro subscription remains configured but multi-pass skips it with a warning.
+If `pi-provider-kiro-dev` is not registered, the saved Kiro subscription remains configured but multi-oauth skips it with a warning.
 
 ## Built-in limits support
 

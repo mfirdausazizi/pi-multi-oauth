@@ -1,5 +1,5 @@
 {
-  "name": "pi-multi-pass",
+  "name": "pi-multi-oauth",
   "version": "1.4.0",
   "type": "module",
   "description": "Multi-subscription extension for pi -- use multiple OAuth accounts for Anthropic, Codex, Copilot, Gemini, Antigravity, and Kiro",
@@ -17,7 +17,7 @@
   "author": "hjanuschka",
   "repository": {
     "type": "git",
-    "url": "https://github.com/mfirdausazizi/pi-multi-pass"
+    "url": "https://github.com/mfirdausazizi/pi-multi-oauth"
   },
   "scripts": {
     "test": "node tests/provider-registration-check.mjs && node tests/subs-login-check.mjs && node tests/kiro-refresh-check.mjs && node tests/pool-edit-check.mjs && node tests/project-aware-limits-check.mjs && node tests/project-restriction-check.mjs && node tests/subs-switch-check.mjs && node tests/subscription-limits-check.mjs && node tests/runtime-failover-check.mjs --retry-start-turn --pool-only --no-loop --failure-path",
