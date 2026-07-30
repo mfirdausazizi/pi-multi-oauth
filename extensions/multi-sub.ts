@@ -51,6 +51,12 @@ import {
 import type { Api, AuthEvent, AuthInteraction, AuthPrompt, Model } from "@earendil-works/pi-ai";
 import { cloneKiroProviderConfig, cloneNativeProvider, createDeferredNativeProvider, refreshKiroCredential } from "../lib/provider-helpers.ts";
 import {
+	createSessionAffinityBinding,
+	pickSessionAffinityMember,
+	readSessionAffinityBinding,
+	type SessionAffinityKey,
+} from "../lib/session-affinity.ts";
+import {
 	Container,
 	Key,
 	SelectList,
@@ -1425,6 +1431,8 @@ interface PoolSelectorContext {
 	day: DayOfWeek;
 	/** Last user prompt, if available */
 	prompt?: string;
+	/** Stable Pi session ID when selection is session-affinity driven */
+	sessionId?: string;
 }
 
 /** Function signature a custom selector script must export (default export). */
@@ -1463,6 +1471,8 @@ interface PoolConfig {
 	/** Selection strategy when picking the next member on failover.
 	 *  Defaults to "round-robin" when omitted. */
 	strategy?: PoolStrategy;
+	/** Keep each Pi session bound to one eligible member until manual rebind or failover. */
+	sessionAffinity?: boolean;
 	/** Per-member schedule rules (keyed by provider name).
 	 *  Only used when strategy is "scheduled". */
 	memberSchedule?: Record<string, MemberSchedule>;
@@ -2059,6 +2069,7 @@ async function runCustomSelector(
 	currentProvider: string,
 	modelId: string,
 	prompt?: string,
+	sessionId?: string,
 ): Promise<string | undefined> {
 	if (!pool.selectorScript) return undefined;
 	const fn = await loadSelectorScript(pool.selectorScript);
@@ -2074,6 +2085,7 @@ async function runCustomSelector(
 		hour: now.getHours(),
 		day: getDayOfWeek(now),
 		prompt,
+		sessionId,
 	};
 
 	try {
@@ -2102,7 +2114,7 @@ interface PoolState {
 	cooldownMs: number;
 }
 
-class PoolManager {
+export class PoolManager {
 	private pools: Map<string, PoolConfig> = new Map();
 	private poolStates: Map<string, PoolState> = new Map();
 	/** Map from provider name -> pool name (for quick lookup) */
@@ -2163,6 +2175,104 @@ class PoolManager {
 	getPoolForProvider(providerName: string): PoolConfig | undefined {
 		const poolName = this.providerToPool.get(providerName);
 		return poolName ? this.pools.get(poolName) : undefined;
+	}
+
+	private getSessionAffinityKey(
+		pool: PoolConfig,
+		modelId: string,
+		ctx: ExtensionContext | ExtensionCommandContext,
+	): SessionAffinityKey {
+		return {
+			sessionId: ctx.sessionManager.getSessionId(),
+			poolName: pool.name,
+			modelId,
+		};
+	}
+
+	private persistSessionAffinityBinding(
+		pool: PoolConfig,
+		modelId: string,
+		provider: string,
+		ctx: ExtensionContext | ExtensionCommandContext,
+	): void {
+		if (!pool.sessionAffinity) return;
+		const key = this.getSessionAffinityKey(pool, modelId, ctx);
+		const existing = readSessionAffinityBinding(ctx.sessionManager.getBranch(), key);
+		if (existing?.provider === provider) return;
+		this.pi.appendEntry(
+			"pi-multi-oauth:pool-affinity",
+			createSessionAffinityBinding(key, provider),
+		);
+	}
+
+	bindSessionAffinity(
+		model: Model<Api> | undefined,
+		ctx: ExtensionContext | ExtensionCommandContext,
+	): void {
+		if (!model) return;
+		const pool = this.getPoolForProvider(model.provider);
+		if (!pool?.sessionAffinity) return;
+		this.persistSessionAffinityBinding(pool, model.id, model.provider, ctx);
+	}
+
+	private async selectSessionAffinityMember(
+		pool: PoolConfig,
+		model: Model<Api>,
+		ctx: ExtensionContext | ExtensionCommandContext,
+	): Promise<string | undefined> {
+		const authStorage = getAuthStorage(ctx);
+		const available = this.getAvailableMembers(pool, authStorage).filter((provider) =>
+			Boolean(ctx.modelRegistry.find(provider, model.id)),
+		);
+		if (available.length === 0) return undefined;
+
+		const key = this.getSessionAffinityKey(pool, model.id, ctx);
+		const binding = readSessionAffinityBinding(ctx.sessionManager.getBranch(), key);
+		if (binding && available.includes(binding.provider)) return binding.provider;
+
+		const strategy = pool.strategy || "round-robin";
+		if (strategy === "quota-first") {
+			const best = await this.getQuotaBestMember(pool, "", authStorage);
+			if (best && available.includes(best)) return best;
+		} else if (strategy === "scheduled") {
+			const best = getScheduledMemberOrder(pool, available, new Date())[0];
+			if (best) return best;
+		} else if (strategy === "custom") {
+			const best = await runCustomSelector(
+				pool,
+				available,
+				model.provider,
+				model.id,
+				undefined,
+				key.sessionId,
+			);
+			if (best) return best;
+		}
+		return pickSessionAffinityMember(key, available);
+	}
+
+	async applySessionAffinity(
+		model: Model<Api> | undefined,
+		ctx: ExtensionContext | ExtensionCommandContext,
+	): Promise<boolean> {
+		if (!model) return false;
+		const pool = this.getPoolForProvider(model.provider);
+		if (!pool?.sessionAffinity) return false;
+		const provider = await this.selectSessionAffinityMember(pool, model, ctx);
+		if (!provider) return false;
+		if (provider === model.provider) {
+			this.persistSessionAffinityBinding(pool, model.id, provider, ctx);
+			return true;
+		}
+
+		const nextModel = ctx.modelRegistry.find(provider, model.id);
+		if (!nextModel || !(await this.pi.setModel(nextModel))) return false;
+		this.persistSessionAffinityBinding(pool, model.id, provider, ctx);
+		ctx.ui.notify(
+			`[pool:${pool.name}] session affinity: ${provider} selected for this session`,
+			"info",
+		);
+		return true;
 	}
 
 	/** Get available (non-exhausted, authenticated) members of a pool */
@@ -2675,6 +2785,7 @@ class PoolManager {
 			ctx.ui.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
 			return false;
 		}
+		this.bindSessionAffinity(nextModel, ctx);
 
 		cascade.attemptedProviders.add(nextCandidate.provider);
 		if (typeof nextCandidate.chainIndex === "number") {
@@ -3329,6 +3440,7 @@ function buildPoolConfig(input: {
 	strategy?: PoolStrategy;
 	memberSchedule?: Record<string, MemberSchedule>;
 	selectorScript?: string;
+	sessionAffinity?: boolean;
 }): { ok: true; pool: PoolConfig } | { ok: false; error: string } {
 	const name = input.name.trim();
 	if (!name) {
@@ -3344,6 +3456,9 @@ function buildPoolConfig(input: {
 		members: [...input.members],
 		enabled: input.enabled ?? true,
 	};
+	if (input.sessionAffinity) {
+		pool.sessionAffinity = true;
+	}
 	if (input.strategy && input.strategy !== "round-robin") {
 		pool.strategy = input.strategy;
 	}
@@ -3680,6 +3795,11 @@ async function promptForPoolDefinition(
 		}
 	}
 
+	const sessionAffinity = await ctx.ui.confirm(
+		"Session affinity",
+		"Keep each Pi session on one pool member until you switch manually or it fails?",
+	);
+
 	const built = buildPoolConfig({
 		name: poolName,
 		baseProvider,
@@ -3688,6 +3808,7 @@ async function promptForPoolDefinition(
 		strategy,
 		memberSchedule,
 		selectorScript,
+		sessionAffinity,
 	});
 	if (!built.ok) {
 		ctx.ui.notify(built.error, "warning");
@@ -3995,6 +4116,11 @@ async function showPoolActions(
 				description: `Currently ${currentStrategy}`,
 			},
 			{
+				value: "affinity",
+				label: "session affinity",
+				description: `Currently ${pool.sessionAffinity ? "enabled" : "disabled"}`,
+			},
+			{
 				value: "toggle",
 				label: pool.enabled ? "disable" : "enable",
 				description: `Currently ${pool.enabled ? "enabled" : "disabled"}`,
@@ -4020,6 +4146,17 @@ async function showPoolActions(
 	}
 	if (action === "strategy") {
 		await changePoolStrategy(ctx, poolManager, config, pool);
+		return undefined;
+	}
+	if (action === "affinity") {
+		if (pool.sessionAffinity) delete pool.sessionAffinity;
+		else pool.sessionAffinity = true;
+		saveGlobalConfig(config);
+		reloadPoolManagerForCurrentProject(ctx, poolManager);
+		ctx.ui.notify(
+			`Pool "${pool.name}" session affinity ${pool.sessionAffinity ? "enabled" : "disabled"}.`,
+			"info",
+		);
 		return undefined;
 	}
 	if (action === "toggle") {
@@ -4170,7 +4307,7 @@ function formatPoolListDescription(
 ): string {
 	const summary = summarizePoolHealth(pool, authStorage, poolManager);
 	const status = pool.enabled ? "enabled" : "disabled";
-	return `${pool.baseProvider} | ${summary.memberCount} member${summary.memberCount === 1 ? "" : "s"} (${summary.authedCount} authed, ${summary.availableCount} available) | ${status}${summary.unavailableCount > 0 ? ` | ${summary.unavailableCount} unavailable` : ""}`;
+	return `${pool.baseProvider} | ${summary.memberCount} member${summary.memberCount === 1 ? "" : "s"} (${summary.authedCount} authed, ${summary.availableCount} available) | ${status}${pool.sessionAffinity ? " | affinity" : ""}${summary.unavailableCount > 0 ? ` | ${summary.unavailableCount} unavailable` : ""}`;
 }
 
 function formatPoolStatusLines(
@@ -4184,6 +4321,7 @@ function formatPoolStatusLines(
 		`=== ${pool.name} (${pool.enabled ? "enabled" : "disabled"}) ===`,
 		`provider: ${pool.baseProvider}`,
 		`strategy: ${strategy}`,
+		`session affinity: ${pool.sessionAffinity ? "enabled" : "disabled"}`,
 		`members: ${summary.memberCount}`,
 		`availability: ${summary.statusLabel}`,
 	];
@@ -5438,11 +5576,21 @@ export default function multiSub(pi: ExtensionAPI) {
 			ctx.ui.setStatus("multi-pass", statusParts.join(" | "));
 		}
 
-		await enforceProjectRestriction(ctx, "session");
+		const allowed = await enforceProjectRestriction(ctx, "session");
+		if (allowed) await poolManager.applySessionAffinity(ctx.model, ctx);
 	});
 
-	pi.on("model_select", async (_event, ctx) => {
-		await enforceProjectRestriction(ctx, "model");
+	pi.on("model_select", async (event, ctx) => {
+		const projectSwitch = projectRestrictionSwitchInFlight;
+		const allowed = await enforceProjectRestriction(ctx, "model");
+		if (
+			allowed &&
+			!projectSwitch &&
+			event.source !== "restore" &&
+			ctx.model?.provider === event.model.provider
+		) {
+			poolManager.bindSessionAffinity(event.model, ctx);
+		}
 	});
 
 	pi.on("input", async (event, ctx) => {
@@ -5450,6 +5598,7 @@ export default function multiSub(pi: ExtensionAPI) {
 			return { action: "continue" as const };
 		}
 		const ok = await enforceProjectRestriction(ctx, "input");
+		if (ok) await poolManager.applySessionAffinity(ctx.model, ctx);
 		return ok ? { action: "continue" as const } : { action: "handled" as const };
 	});
 

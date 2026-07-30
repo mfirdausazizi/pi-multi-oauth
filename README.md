@@ -13,6 +13,7 @@ pi install git:github.com/mfirdausazizi/pi-multi-oauth
 - **Multiple subscriptions**: Add extra OAuth accounts for Anthropic, Codex, Copilot, Gemini, Antigravity, and Kiro
 - **Rotation pools**: Group subscriptions and auto-rotate on rate limits
 - **Smart pool strategies**: `round-robin`, `quota-first`, `scheduled` (time windows), `custom` (JS script hook)
+- **Session-affinity pools**: Keep each Pi session on one account, with automatic rebinding on failover or manual switch
 - **Fallback chains**: Define ordered cross-pool/model failover via `/pool chain`
 - **Model presets**: Named routing shortcuts across providers (`/mp-preset coding-premium`)
 - **Built-in limits checks**: Inspect subscription headroom across accounts with `/subs limits`
@@ -162,18 +163,37 @@ cd ~/side-project
 
 ### Pool selection strategy
 
-Each pool has a `strategy` that controls how the next member is chosen on failover:
+Each pool has a `strategy` that controls failover ordering and, when session affinity is enabled, the session's initial member assignment:
 
 | Strategy | Behavior |
 |---|---|
-| `round-robin` | Rotate sequentially through members (default) |
+| `round-robin` | Rotate sequentially on failover; distribute new affinity sessions deterministically |
 | `quota-first` | Query built-in quota checkers and prefer the member with the most remaining quota |
 | `scheduled` | Use per-member time windows and priority roles |
 | `custom` | Delegate to a user-provided JS selector script |
 
 Set the strategy during pool creation (`/pool create`) or change it later via `/pool list` -> select pool -> `strategy`.
 
-All strategies fall back to round-robin when their specific data is unavailable.
+When strategy-specific data is unavailable, normal failover uses round-robin and affinity assignment uses a deterministic session hash.
+
+### Session affinity
+
+Set `sessionAffinity` to keep each Pi session on one pool member. The existing strategy chooses the initial member; subsequent requests stay on that member until you switch manually or it becomes unavailable.
+
+```json
+{
+  "name": "codex-pool",
+  "baseProvider": "openai-codex",
+  "members": ["openai-codex", "openai-codex-2", "openai-codex-3"],
+  "enabled": true,
+  "strategy": "quota-first",
+  "sessionAffinity": true
+}
+```
+
+Enable it during `/pool create` or via `/pool list` -> select pool -> `session affinity`.
+
+Bindings are stored in the Pi session and scoped by pool and model. Resuming a session restores its binding; a fork has a new session ID and receives a fresh assignment. A rate-limit failover or manual switch to another member updates the binding. Project restrictions and missing authentication always take priority.
 
 #### `quota-first`
 
@@ -252,13 +272,14 @@ Script paths are resolved relative to `~/.pi/agent/`. Absolute paths and `~/` pa
 // ~/.pi/agent/selectors/my-codex-selector.js
 module.exports = async function select(ctx) {
   // ctx.members:         string[]  -- available (non-exhausted, authenticated) members
-  // ctx.currentProvider: string    -- the provider that just hit a rate limit
+  // ctx.currentProvider: string    -- the currently selected provider
   // ctx.modelId:         string    -- the model ID being used
   // ctx.pool:            object    -- { name, baseProvider, members }
   // ctx.timestamp:       number    -- current Unix timestamp (ms)
   // ctx.hour:            number    -- current hour (0-23, local time)
   // ctx.day:             string    -- current day of week ("mon".."sun")
   // ctx.prompt:          string?   -- last user prompt, if available
+  // ctx.sessionId:       string?   -- Pi session ID during affinity assignment
   //
   // Return: string (provider name), string[] (ordered preference), or undefined (fall back)
 
